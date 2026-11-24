@@ -36,11 +36,13 @@ CODE_MESSAGE = "Enter the access code at the top of the page (ask the presenter)
 
 def _log(record):
     """Write each run to the Render logs (no prompt, no key) as evaluation evidence."""
-    safe = {k: v for k, v in record.items() if k != "prompt"}
+    fields = ("run_id", "timestamp_utc", "version", "model", "api_called",
+              "status", "response_id", "api_status", "usage", "error_type")
+    safe = {k: record[k] for k in fields if k in record}
     print("RUBRIC_COACH_RECORD " + json.dumps(safe, ensure_ascii=False, default=str), flush=True)
 
 EVIDENCE_LABELS = {"FOUND": "✓ found in answer", "NOT_FOUND": "⚠ not in answer",
-                   "NO_QUOTE": "no quote", "MISSING": "⚠ missing"}
+                   "NO_QUOTE": "no quote", "MISSING": "⚠ missing", "TOO_LONG": "⚠ over 30 words"}
 STATUS_LABELS = {"NO_AUTOMATIC_REVIEW_FLAGS": "Checks passed", "REVIEW_REQUIRED": "Teacher review required",
                  "INPUT_REQUIRED": "Not graded: input problem", "API_ERROR": "Not graded: API error",
                  "API_OUTPUT_INCOMPLETE": "Not graded: incomplete response", "FILE_ERROR": "Not graded: file problem"}
@@ -93,6 +95,13 @@ def organize_click(raw_rubric, task, current_structured, code):
     if parse_rubric(raw_rubric)["criteria"] and not parse_rubric(raw_rubric)["errors"]:
         status, rows = preview_rubric(raw_rubric)
         return raw_rubric, "Your rubric is already in the required format. " + status, rows
+    identifiers = privacy_issues(raw_rubric) + privacy_issues(task)
+    if identifiers:
+        return current_structured, " | ".join(identifiers) + " No API call made.", []
+    preserved = organize_maximum_only(raw_rubric)
+    if preserved is not None:
+        status, rows = preview_rubric(preserved)
+        return preserved, "No scoring descriptions were invented. Add descriptors and resolve TEACHER CHECK before grading. " + status, rows
     if not _code_ok(code):
         return current_structured, CODE_MESSAGE, []
     if not _reserve(1):
@@ -146,12 +155,18 @@ def _collect_answers(files, pasted):
     if isinstance(pasted, str) and pasted.strip():
         items.append({"name": "Pasted answer", "text": pasted.strip(), "error": None})
     # make names unique
-    seen = {}
+    seen = set()
     for it in items:
-        n = it["name"]
-        seen[n] = seen.get(n, 0) + 1
-        if seen[n] > 1:
-            it["name"] = f"{n} ({seen[n]})"
+        base = it["name"]
+        name, suffix = base, 2
+        while name in seen:
+            name = f"{base} ({suffix})"
+            suffix += 1
+        it["name"] = name
+        seen.add(name)
+        identifiers = privacy_issues(base)
+        if identifiers and not it["error"]:
+            it["error"] = identifiers[0]
     return items
 
 
@@ -186,8 +201,17 @@ def _detail(entry, criteria):
 
 def _write_csv(results, criteria):
     path = os.path.join(tempfile.mkdtemp(prefix="results_"), "rubric_coach_results.csv")
+    def safe_cell(value):
+        if isinstance(value, str) and value.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")):
+            return "'" + value
+        return value
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
+        class SafeWriter:
+            def __init__(self, stream):
+                self.writer = csv.writer(stream)
+            def writerow(self, row):
+                self.writer.writerow([safe_cell(cell) for cell in row])
+        w = SafeWriter(f)
         w.writerow(["Answer file", "Status", "Suggested total", "Maximum"]
                    + [f"{c['name']} score" for c in criteria]
                    + [f"{c['name']} evidence check" for c in criteria]
@@ -330,7 +354,7 @@ with gr.Blocks(title="Rubric Coach | Assessment Assistant") as assessment_demo:
     download = gr.File(label="Download all results (CSV, opens in Excel)", interactive=False)
     student_pick = gr.Dropdown(choices=[], label="View one student's feedback", value=None)
     with gr.Row():
-        score_table = gr.Dataframe(headers=["Criterion", "Suggested score", "Maximum", "Evidence check"],
+        score_table = gr.Dataframe(headers=["Criterion", "AI draft score (unapproved)", "Maximum", "Evidence check"],
                                    datatype=["str", "str", "number", "str"], interactive=False)
         feedback_box = gr.Textbox(label="Feedback and evidence", lines=16, interactive=False)
     with gr.Accordion("Inspect this response (run record)", open=False):
@@ -338,7 +362,8 @@ with gr.Blocks(title="Rubric Coach | Assessment Assistant") as assessment_demo:
     gr.Markdown("Educational prototype · Zijia Luo · EDUC 6192 Course Project\n\n"
                 "Automatic checks confirm the response format, that every score is an allowed value for its criterion, "
                 "and that each quoted piece of evidence really appears in the student's answer. "
-                "They do not prove the assessment is correct.")
+                "They do not prove the assessment is correct. A flagged total is withheld. "
+                "Privacy screening catches common identifiers only; remove all identifying information yourself.")
 
     example_pick.change(load_example, inputs=[example_pick, task_box, raw_rubric_box, rubric_box, answer_files, pasted_answer],
                         outputs=[task_box, raw_rubric_box, rubric_box, answer_files, pasted_answer], api_name=False)
