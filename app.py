@@ -44,6 +44,7 @@ def _log(record):
 EVIDENCE_LABELS = {"FOUND": "✓ found in answer", "NOT_FOUND": "⚠ not in answer",
                    "NO_QUOTE": "no quote", "MISSING": "⚠ missing", "TOO_LONG": "⚠ over 30 words"}
 STATUS_LABELS = {"NO_AUTOMATIC_REVIEW_FLAGS": "Checks passed", "REVIEW_REQUIRED": "Teacher review required",
+                 "BASELINE_UNVALIDATED": "Baseline output: unvalidated",
                  "INPUT_REQUIRED": "Not graded: input problem", "API_ERROR": "Not graded: API error",
                  "API_OUTPUT_INCOMPLETE": "Not graded: incomplete response", "FILE_ERROR": "Not graded: file problem"}
 
@@ -190,6 +191,8 @@ def _detail(entry, criteria):
             text += f"\nStudent's words: \"{q.strip()}\" [{EVIDENCE_LABELS.get(ev_check.get(c['id']), 'not checked')}]"
         blocks.append(text)
     details = "\n\n".join(blocks)
+    if rec.get("purpose") == "same_model_baseline":
+        details = "BASELINE OUTPUT - no automatic output checks; evaluator review required.\n\n" + (rec.get("raw_output") or "")
     issues = rec.get("issues") or ([entry["error"]] if entry.get("error") else [])
     if issues:
         details += "\n\nChecks: " + " | ".join(issues)
@@ -233,7 +236,7 @@ def _write_csv(results, criteria):
     return path
 
 
-def grade_all(task, rubric_text, files, pasted, code, progress=gr.Progress()):
+def grade_all(task, rubric_text, files, pasted, code, baseline=False, progress=gr.Progress()):
     empty = ([], gr.Dropdown(choices=[], value=None), [], "", {}, None, {"results": [], "criteria": []})
     setup = validate_inputs(task, rubric_text, "placeholder answer")
     if not setup["valid"]:
@@ -263,7 +266,8 @@ def grade_all(task, rubric_text, files, pasted, code, progress=gr.Progress()):
         if gradable:
             progress((0, len(gradable)), desc="Grading answers")
             with ThreadPoolExecutor(max_workers=PARALLEL_REQUESTS) as pool:
-                futures = {pool.submit(grade_answer, task.strip(), rubric_text, it["text"], client, it["name"]): it
+                grader = grade_baseline_answer if baseline else grade_answer
+                futures = {pool.submit(grader, task.strip(), rubric_text, it["text"], client, it["name"]): it
                            for it in gradable}
                 for done, fut in enumerate(as_completed(futures), start=1):
                     it = futures[fut]
@@ -292,6 +296,8 @@ def grade_all(task, rubric_text, files, pasted, code, progress=gr.Progress()):
     n_fail = len(ordered) - n_ok - n_review
     status = (f"Graded {len(ordered)} answer(s): {n_ok} passed the automatic checks, {n_review} need teacher review, "
               f"{n_fail} could not be graded. All scores are suggestions; a teacher must review them.")
+    if baseline:
+        status = f"Baseline comparison: {len(ordered)} response(s). Inspect raw output below; scores are not automatically validated or approved."
     names = [e["name"] for e in ordered]
     rows, details, shown = _detail(ordered[0], criteria)
     csv_path = _write_csv(ordered, criteria)
@@ -345,6 +351,11 @@ with gr.Blocks(title="Rubric Coach | Assessment Assistant") as assessment_demo:
         answer_files = gr.File(label=f"Upload answers — one student per file (up to {MAX_BATCH}; .docx, .pdf, .txt)",
                                file_count="multiple", file_types=SUPPORTED_TYPES, type="filepath")
         pasted_answer = gr.Textbox(label="…or paste a single answer", lines=6, max_lines=14)
+    with gr.Accordion("Project evaluation comparison", open=False):
+        gr.Markdown("For the evaluation study only: compare the exact simpler prompt with the full application. "
+                    "The baseline uses the same model and a 3,600-token ceiling, returns raw feedback, "
+                    "and performs no output validation. Leave this off for normal use.")
+        baseline_mode = gr.Checkbox(label="Use simple prompt baseline for this run", value=False)
     grade_button = gr.Button("Grade all answers", variant="primary")
     gr.Markdown("Each answer is one API request. Grading several answers can take a minute or more.")
 
@@ -372,7 +383,7 @@ with gr.Blocks(title="Rubric Coach | Assessment Assistant") as assessment_demo:
     organize_button.click(organize_click, inputs=[raw_rubric_box, task_box, rubric_box, code_box],
                           outputs=[rubric_box, status_box, rubric_table], concurrency_limit=1, api_name=False)
     check_button.click(preview_rubric, inputs=rubric_box, outputs=[status_box, rubric_table], api_name=False)
-    grade_button.click(grade_all, inputs=[task_box, rubric_box, answer_files, pasted_answer, code_box],
+    grade_button.click(grade_all, inputs=[task_box, rubric_box, answer_files, pasted_answer, code_box, baseline_mode],
                        outputs=[status_box, summary_table, student_pick, score_table, feedback_box, evidence_box,
                                 download, results_state],
                        concurrency_limit=1, api_name=False)
